@@ -1,5 +1,6 @@
 # Local Python environment and caches
 .venv/
+*.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -19,14 +19,16 @@ class _SignalState:
 class OrderProposalEngine:
     """Pure read-only proposal/risk preview. It has no broker or order methods."""
 
-    allowed_symbols = frozenset({"NVDA", "700.HK", "2513.HK"})
-    lot_sizes = {"NVDA": 1, "700.HK": 100, "2513.HK": 100}
-
     def __init__(self, confirmation_s: float = 3.0,
                  max_symbol_weight: float = 0.10,
                  max_total_weight: float = 0.70,
                  proposal_cooldown_s: float = 300.0,
-                 max_daily_loss: float = 0.02) -> None:
+                 max_daily_loss: float = 0.02, *,
+                 allowed_symbols=(), lot_sizes: dict | None = None,
+                 friction: float = 0.0008) -> None:
+        self.allowed_symbols = frozenset(allowed_symbols)
+        self.lot_sizes = lot_sizes or {}
+        self.friction = friction
         self.confirmation_s = confirmation_s
         self.max_symbol_weight = max_symbol_weight
         self.max_total_weight = max_total_weight
@@ -120,7 +122,11 @@ class OrderProposalEngine:
         if symbol not in self.allowed_symbols:
             self._set(checks, "allowlist", "blocked", "标的不在交易白名单")
             return result("blocked", "标的不在交易白名单")
-        self._set(checks, "allowlist", "passed", "标的在硬编码白名单内")
+        self._set(checks, "allowlist", "passed", "标的在本次实验配置内")
+        lot = self.lot_sizes.get(symbol, None if symbol.endswith(".HK") else 1)
+        if not isinstance(lot, int) or lot <= 0:
+            self._set(checks, "allowlist", "blocked", "缺少港股每手股数，禁止模拟成交")
+            return result("blocked", "缺少港股每手股数，禁止模拟成交")
         if signal.action == "HOLD":
             self._set(checks, "signal", "observing", "稳定信号为观望")
             return result("observing", "稳定信号为观望")
@@ -130,18 +136,23 @@ class OrderProposalEngine:
                       f"已持续 {held_s:.1f}/{self.confirmation_s:g} 秒")
             return result("confirming", f"等待信号持续 {self.confirmation_s:g} 秒")
         self._set(checks, "confirmation", "passed", "信号持续时间达标")
-        if quote_age_s > 5.0 or "bmp" in quote.feed:
+        if quote.halted or not math.isfinite(quote.close) or quote.close <= 0:
+            self._set(checks, "quote", "blocked", "停牌或价格无效")
+            return result("blocked", "停牌或价格无效")
+        if quote_age_s >= 5.0 or "bmp" in quote.feed:
             self._set(checks, "quote", "blocked", "报价过期或为延迟行情")
             return result("blocked", "报价过期或为延迟行情")
         if quote.feed == "overnight":
             self._set(checks, "quote", "blocked", "隔夜指示性报价不可用于订单提案")
             return result("blocked", "隔夜指示性报价不可用于订单提案")
         self._set(checks, "quote", "passed", "行情新鲜且可用于提案")
-        session_reason = self.calendar.session_reason(symbol, quote.market_time_ms)
+        session_reason = (self.calendar.simulation_session_reason(symbol, quote.market_time_ms)
+                          if quote.feed.startswith("longbridge-us-") else
+                          self.calendar.session_reason(symbol, quote.market_time_ms))
         if session_reason:
             self._set(checks, "session", "blocked", session_reason)
             return result("blocked", session_reason)
-        self._set(checks, "session", "passed", "处于常规连续交易时段")
+        self._set(checks, "session", "passed", "处于允许的模拟交易时段")
         if not account or account.get("status") != "ok":
             self._set(checks, "account", "blocked", "模拟账户数据尚未就绪")
             return result("blocked", "模拟账户数据尚未就绪")
@@ -171,7 +182,6 @@ class OrderProposalEngine:
         positions = account.get("positions", [])
         position = next((item for item in positions if item.get("symbol") == symbol), None)
         current_quantity = float(position.get("quantity", 0)) if position else 0.0
-        lot = self.lot_sizes[symbol]
         if signal.action == "SELL":
             if current_quantity <= 0:
                 self._set(checks, "long_only", "blocked", "无可卖持仓；禁止裸卖空")
@@ -188,7 +198,7 @@ class OrderProposalEngine:
             if not math.isfinite(fx) or equity <= 0:
                 self._set(checks, "cash", "blocked", "缺少账户汇率或净资产")
                 return result("blocked", "缺少账户汇率或净资产")
-            order_value = quote.close * lot * fx
+            order_value = quote.close * lot * fx * (1 + self.friction)
             current_weight = float(position.get("position_weight") or 0) if position else 0.0
             total_weight = sum(float(item.get("position_weight") or 0) for item in positions)
             projected_symbol = current_weight + order_value / equity

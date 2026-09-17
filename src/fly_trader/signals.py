@@ -58,8 +58,12 @@ class NeuralSignalFilter:
         self.window_mean = 0.0
         self.confirmed = "HOLD"
         self.last_change = -float("inf")
+        self.last_now = 0.0
+        self.market_stale = True
 
     def update(self, raw: Signal, now: float, stale: bool = False) -> Signal:
+        self.last_now = now
+        self.market_stale = stale
         self.scores.append(raw.score)
         self.window_mean = sum(self.scores) / len(self.scores)
         alpha = 1.0 - math.exp(-math.log(2.0) / (self.hz * self.ema_half_life_s))
@@ -114,8 +118,19 @@ class NeuralSignalFilter:
 
     def diagnostics(self) -> dict[str, float | int | bool | str]:
         calibrated = (not self.adaptive or
-                      (self.baseline and self.baseline[-1][0] >= self.calibration_s and
+                      (self.last_now >= self.calibration_s and
                        len(self.baseline) >= self.baseline_min_samples))
+        remaining = max(0.0, self.calibration_s - self.last_now) if self.adaptive else 0.0
+        if not self.adaptive:
+            status = "ready"
+        elif not self.baseline and self.market_stale:
+            status = "waiting_market"
+        elif calibrated:
+            status = "ready"
+        elif remaining > 0:
+            status = "warming_up"
+        else:
+            status = "waiting_samples"
         return {
             "window_s": self.window_s,
             "samples": len(self.scores),
@@ -126,11 +141,13 @@ class NeuralSignalFilter:
             "exit_threshold": self.exit_threshold,
             "cooldown_s": self.cooldown_s,
             "adaptive": self.adaptive,
-            "calibration_status": "ready" if calibrated else "warming_up",
+            "calibration_status": status,
             "calibration_s": self.calibration_s,
-            "warmup_remaining_s": (0.0 if not self.baseline else
-                                     max(0.0, self.calibration_s - self.baseline[-1][0])),
+            "warmup_remaining_s": remaining,
             "baseline_samples": len(self.baseline),
+            "baseline_min_samples": self.baseline_min_samples,
+            "market_stale": self.market_stale,
+            "calibration_time_complete": remaining == 0,
             "enter_percentile": self.enter_percentile,
             "distance_to_trigger": max(0.0, self.enter_threshold - abs(self.ema_score)),
         }
@@ -145,6 +162,8 @@ class NeuralSignalFilter:
             "last_change": self.last_change,
             "enter_threshold": self.enter_threshold,
             "exit_threshold": self.exit_threshold,
+            "last_now": self.last_now,
+            "market_stale": self.market_stale,
         }
 
     def restore(self, value: dict) -> None:
@@ -160,6 +179,8 @@ class NeuralSignalFilter:
             self.last_change = float(value["last_change"])
             self.enter_threshold = float(value["enter_threshold"])
             self.exit_threshold = float(value["exit_threshold"])
+            self.last_now = float(value.get("last_now", self.baseline[-1][0] if self.baseline else 0))
+            self.market_stale = bool(value.get("market_stale", True))
         except (KeyError, TypeError, ValueError):
             self.scores.clear()
             self.baseline.clear()

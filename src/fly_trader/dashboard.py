@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import copy
 import math
 import threading
 import webbrowser
@@ -27,9 +29,32 @@ class DashboardState:
         self.latest: dict = {"status": "starting", "paused": False}
         self.assets: dict[str, dict] = {}
         self.accounts: dict[str, dict] = {}
+        self.track_accounts: dict[str, dict] = {}
         self.proposals: dict[str, dict] = {}
         self.performance: dict[str, dict] = {}
         self.series: deque[dict] = deque(maxlen=300)
+        self.experiment: dict = {"status": "idle"}
+        self.report: dict | None = None
+
+    def reset_run(self) -> None:
+        with self._lock:
+            self.paused = False
+            self.latest = {"status": "preparing", "paused": False}
+            for values in (self.assets, self.accounts, self.track_accounts, self.proposals, self.performance, self.series):
+                values.clear()
+            self.report = None
+
+    def update_experiment(self, values: dict) -> None:
+        with self._lock:
+            self.experiment = copy.deepcopy(values)
+
+    def set_report(self, report: dict) -> None:
+        with self._lock:
+            self.report = copy.deepcopy(report)
+
+    def get_report(self) -> dict | None:
+        with self._lock:
+            return copy.deepcopy(self.report)
 
     def update(self, latest: dict, append: bool = False) -> None:
         with self._lock:
@@ -46,14 +71,20 @@ class DashboardState:
             return _json_safe({
                 "latest": dict(self.latest), "assets": dict(self.assets),
                 "accounts": dict(self.accounts), "proposals": dict(self.proposals),
+                "track_accounts": dict(self.track_accounts),
                 "performance": dict(self.performance),
                 "series": list(self.series),
+                "experiment": copy.deepcopy(self.experiment),
             })
 
     def update_account(self, market: str, values: dict) -> None:
         with self._lock:
             current = self.accounts.setdefault(market, {"market": market})
             current.update(values)
+
+    def update_track_accounts(self, market: str, values: dict) -> None:
+        with self._lock:
+            self.track_accounts[market] = values
 
     def get_account(self, market: str) -> dict | None:
         with self._lock:
@@ -93,7 +124,7 @@ class DashboardState:
 
 
 def start_dashboard(state: DashboardState, port: int = 8787,
-                    open_browser: bool = True) -> ThreadingHTTPServer:
+                    open_browser: bool = True, *, controller=None, loop=None) -> ThreadingHTTPServer:
     web_root = Path(__file__).with_name("web")
 
     class Handler(BaseHTTPRequestHandler):
@@ -107,6 +138,14 @@ def start_dashboard(state: DashboardState, port: int = 8787,
 
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
+            if path == "/api/experiment/report":
+                report = state.get_report()
+                if report is None:
+                    self._send(b'{"error":"report not ready"}', "application/json", 409)
+                else:
+                    self._send(json.dumps(report, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+                               "application/json; charset=utf-8")
+                return
             if path == "/api/state":
                 body = json.dumps(state.snapshot(), ensure_ascii=False).encode("utf-8")
                 self._send(body, "application/json; charset=utf-8")
@@ -120,16 +159,35 @@ def start_dashboard(state: DashboardState, port: int = 8787,
             self._send(target.read_bytes(), f"{mime}; charset=utf-8")
 
         def do_POST(self) -> None:
-            if urlsplit(self.path).path != "/api/pause":
+            from .session import StateConflict
+            path = urlsplit(self.path).path
+            if path not in {"/api/pause", "/api/experiment/start", "/api/experiment/stop"}:
                 self.send_error(404)
                 return
             try:
-                length = min(int(self.headers.get("Content-Length", "0")), 1024)
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 <= length <= 16384:
+                    raise ValueError("请求过大")
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                state.set_paused(bool(payload["paused"]))
-                self._send(json.dumps({"paused": state.is_paused()}).encode(), "application/json")
-            except (ValueError, KeyError, json.JSONDecodeError):
-                self._send(b'{"error":"invalid request"}', "application/json", 400)
+                if not isinstance(payload, dict):
+                    raise ValueError("请求必须为 JSON 对象")
+                if controller is not None:
+                    action = (controller.start(payload) if path.endswith("/start") else
+                              controller.stop() if path.endswith("/stop") else
+                              controller.pause(payload["paused"]))
+                    result = asyncio.run_coroutine_threadsafe(action, loop).result()
+                elif path == "/api/pause":
+                    if not isinstance(payload["paused"], bool):
+                        raise ValueError("paused 必须为布尔值")
+                    state.set_paused(payload["paused"])
+                    result = {"paused": state.is_paused()}
+                else:
+                    raise StateConflict("实验控制器未启动")
+                self._send(json.dumps(result).encode(), "application/json")
+            except StateConflict as error:
+                self._send(json.dumps({"error": str(error)}, ensure_ascii=False).encode("utf-8"), "application/json", 409)
+            except (ValueError, KeyError, TypeError) as error:
+                self._send(json.dumps({"error": str(error)}, ensure_ascii=False).encode("utf-8"), "application/json", 400)
 
         def log_message(self, *_args) -> None:
             pass

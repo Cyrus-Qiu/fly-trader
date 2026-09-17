@@ -30,16 +30,16 @@ def test_local_dashboard_serves_state_and_pause_control():
             assert "果蝇交易实验台" in html
             assert 'data-market="HK"' in html
             assert 'data-market="US"' in html
-            assert "全部持仓（只读）" in html
-            assert "订单提案预演（不下单）" in html
+            assert "持仓与交易统计" in html
+            assert "本地模拟成交风控" in html
             assert 'id="riskChecks"' in html
             assert "果蝇原始信号（主指标）" in html
             assert "人工过滤信号（对照）" in html
             assert "风控可执行信号（对照）" in html
-            assert "本次运行实时收益对比" in html
+            assert "实验资金与收益对比" in html
         with urlopen(base + "/dashboard.js") as response:
             script = response.read().decode("utf-8")
-            for label in ("持仓占比", "现价", "成本", "市值", "当日", "持仓盈亏"):
+            for label in ("累计买入", "累计卖出", "持仓成本价", "已实现盈亏", "未实现盈亏"):
                 assert label in script
     finally:
         server.shutdown()

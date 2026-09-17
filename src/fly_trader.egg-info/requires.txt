@@ -1,9 +1,0 @@
-numpy<3,>=2.3
-scipy<2,>=1.16
-pandas<4,>=2.3
-pyarrow<24,>=21
-tigeropen<4,>=3.7
-websockets<17,>=15
-
-[dev]
-pytest<10,>=8.3

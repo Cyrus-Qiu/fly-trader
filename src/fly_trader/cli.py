@@ -6,7 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .runner import run, run_both, run_iex, run_longbridge
+from .runner import serve_experiments
+from .session import validate_config
 from .replay import evaluate, write_report
 
 
@@ -15,21 +16,19 @@ def main() -> None:
     # prevents stale values left in a PowerShell session from shadowing edits.
     load_dotenv(Path(".env"), override=True)
     parser = argparse.ArgumentParser(description="MaleCNS market signal experiment; never submits orders")
-    parser.add_argument("--source", choices=("both", "iex", "tiger", "longbridge", "replay"),
+    parser.add_argument("--source", choices=("both", "iex", "longbridge", "replay"),
                         default="both",
-                        help="iex starts both IEX trades and free overnight indicative quotes")
+                        help="market selection; all live markets use Longbridge (iex is a legacy US-only alias)")
     parser.add_argument("--symbols", nargs="+",
-                        default=["NVDA"])
-    parser.add_argument("--hk-symbols", nargs="+", default=["700.HK", "2513.HK"],
+                        default=[])
+    parser.add_argument("--hk-symbols", nargs="+", default=[],
                         help="Hong Kong symbols used by --source both")
-    parser.add_argument("--config", type=Path, default=Path("config/tiger_openapi_config.properties"))
     parser.add_argument("--cache", type=Path, default=Path("data/malecns"))
     parser.add_argument("--log", type=Path, default=Path("logs/signals.jsonl"))
-    parser.add_argument("--poll-seconds", type=float, default=5.0)
+    parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=64)
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--duration", type=float, default=0,
-                        help="Alpaca stream run seconds; zero runs until Ctrl+C")
+    parser.add_argument("--duration", type=float, default=3600,
+                        help="experiment duration in seconds; explicit zero runs until stopped")
     parser.add_argument("--dashboard-port", type=int, default=8787)
     parser.add_argument("--no-browser", action="store_true",
                         help="start dashboard without opening the browser")
@@ -43,6 +42,8 @@ def main() -> None:
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--include-legacy", action="store_true",
                         help="include pre-schema-8 events in replay; excluded by default")
+    parser.add_argument("--auto-start", action="store_true",
+                        help="start immediately using CLI symbols and duration")
     args = parser.parse_args()
     if args.source == "replay":
         if not args.replay_log:
@@ -50,32 +51,28 @@ def main() -> None:
         report = evaluate(args.replay_log, args.fee_bps, args.slippage_bps,
                           args.seed, args.include_legacy)
         print(write_report(report, args.report))
-    elif args.source == "both":
-        try:
-            asyncio.run(run_both(args.symbols, args.hk_symbols, args.cache, args.log,
-                                 args.duration, args.seed, args.poll_seconds,
-                                 args.dashboard_port, not args.no_browser, args.neural_hz))
-        except KeyboardInterrupt:
-            pass
-        except RuntimeError as error:
-            parser.error(str(error))
-    elif args.source == "iex":
-        try:
-            asyncio.run(run_iex(args.symbols, args.cache, args.log, args.duration, args.seed,
-                                args.dashboard_port, not args.no_browser, args.neural_hz))
-        except KeyboardInterrupt:
-            pass
-    elif args.source == "longbridge":
-        try:
-            asyncio.run(run_longbridge(args.symbols, args.cache, args.log, args.duration,
-                                       args.seed, args.poll_seconds, args.dashboard_port,
-                                       not args.no_browser))
-        except KeyboardInterrupt:
-            pass
-        except RuntimeError as error:
-            parser.error(str(error))
     else:
-        run(args.symbols, args.config, args.cache, args.log, args.poll_seconds, args.once, args.seed)
+        config = None
+        if args.neural_hz is not None and args.neural_hz <= 0:
+            parser.error("--neural-hz must be positive")
+        if args.auto_start:
+            try:
+                config = validate_config({
+                    "us_symbols": args.symbols if args.source in {"both", "iex"} else [],
+                    "hk_symbols": args.hk_symbols if args.source == "both" else (
+                        args.symbols if args.source == "longbridge" else []),
+                    "duration_s": args.duration,
+                }, allow_unlimited=True)
+            except ValueError as error:
+                parser.error(str(error))
+        try:
+            asyncio.run(serve_experiments(
+                args.cache, args.log.parent / "runs", args.dashboard_port,
+                not args.no_browser, args.seed, args.poll_seconds, args.neural_hz, config))
+        except KeyboardInterrupt:
+            pass
+        except RuntimeError as error:
+            parser.error(str(error))
 
 
 if __name__ == "__main__":

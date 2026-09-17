@@ -2,22 +2,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 import asyncio
-import json
 import os
 from collections.abc import AsyncIterator
 
 import pandas as pd
-
-
-def _is_authentication_failure(error: Exception) -> bool:
-    message = str(error).lower()
-    return any(marker in message for marker in (
-        "auth failed", "authentication failed", "unauthorized",
-        "permission denied", "status 401", "status 403",
-        "http 401", "http 403",
-    ))
 
 
 @dataclass(frozen=True)
@@ -37,6 +26,7 @@ class MarketSnapshot:
     bid: float | None = None
     ask: float | None = None
     spread_bps: float | None = None
+    trade_session: str = "regular"
 
     def public_dict(self) -> dict:
         return asdict(self)
@@ -62,157 +52,6 @@ class TimestampDeduplicator:
         return True
 
 
-class TigerDelayedQuoteSource:
-    """Read-only adapter. It constructs QuoteClient only; no trade client exists here."""
-
-    def __init__(self, config_path: Path):
-        from tigeropen.quote.quote_client import QuoteClient
-        from tigeropen.tiger_open_config import TigerOpenClientConfig
-
-        config = TigerOpenClientConfig(props_path=str(config_path))
-        self._client = QuoteClient(config)
-
-    def fetch(self, symbols: list[str]) -> list[MarketSnapshot]:
-        frame = self._client.get_stock_delay_briefs(symbols)
-        return snapshots_from_frame(frame)
-
-
-class IEXTradeAccumulator:
-    """Convert Alpaca IEX trades into monotonically timestamped OHLCV snapshots."""
-
-    def __init__(self) -> None:
-        self._state: dict[str, dict[str, float]] = {}
-
-    def ingest(self, message: dict) -> MarketSnapshot | None:
-        if message.get("T") != "t":
-            return None
-        symbol = str(message["S"]).upper()
-        price = float(message["p"])
-        size = float(message.get("s", 0))
-        timestamp = int(pd.Timestamp(message["t"]).value // 1_000_000)
-        state = self._state.setdefault(symbol, {
-            "reference": price, "open": price, "high": price, "low": price,
-            "close": price, "volume": 0.0,
-        })
-        state["high"] = max(state["high"], price)
-        state["low"] = min(state["low"], price)
-        state["close"] = price
-        state["volume"] += size
-        return MarketSnapshot(
-            symbol=symbol,
-            market_time_ms=timestamp,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
-            # Until a session bootstrap endpoint is added, pre_close is the
-            # first IEX trade observed after this process connects.
-            pre_close=state["reference"],
-            open=state["open"], high=state["high"], low=state["low"],
-            close=state["close"], volume=state["volume"], halted=0,
-            feed="iex", event_type="trade",
-        )
-
-
-class OvernightQuoteAccumulator:
-    """Convert free real-time indicative overnight quotes into midpoint OHLC."""
-
-    def __init__(self, max_spread_bps: float = 100.0, max_jump_fraction: float = 0.02) -> None:
-        self._state: dict[str, dict[str, float]] = {}
-        self.max_spread_bps = max_spread_bps
-        self.max_jump_fraction = max_jump_fraction
-
-    def ingest(self, message: dict) -> MarketSnapshot | None:
-        if message.get("T") != "q":
-            return None
-        bid, ask = float(message.get("bp", 0)), float(message.get("ap", 0))
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return None
-        symbol = str(message["S"]).upper()
-        midpoint = (bid + ask) / 2.0
-        spread_bps = (ask - bid) / midpoint * 10_000.0
-        if spread_bps > self.max_spread_bps:
-            return None
-        timestamp = int(pd.Timestamp(message["t"]).value // 1_000_000)
-        state = self._state.setdefault(symbol, {
-            "reference": midpoint, "open": midpoint, "high": midpoint,
-            "low": midpoint, "close": midpoint,
-        })
-        if state["close"] > 0 and abs(midpoint / state["close"] - 1.0) > self.max_jump_fraction:
-            return None
-        state["high"] = max(state["high"], midpoint)
-        state["low"] = min(state["low"], midpoint)
-        state["close"] = midpoint
-        return MarketSnapshot(
-            symbol=symbol, market_time_ms=timestamp,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
-            pre_close=state["reference"], open=state["open"],
-            high=state["high"], low=state["low"], close=state["close"],
-            volume=0.0, halted=0, feed="overnight",
-            event_type="indicative_quote",
-            bid=bid, ask=ask, spread_bps=spread_bps,
-        )
-
-
-class AlpacaMarketSource:
-    """Read-only Alpaca market-data stream; contains no brokerage client."""
-
-    urls = {
-        "iex": "wss://stream.data.alpaca.markets/v2/iex",
-        "overnight": "wss://stream.data.alpaca.markets/v1beta1/overnight",
-    }
-
-    def __init__(self, symbols: list[str], feed: str = "iex",
-                 key: str | None = None, secret: str | None = None):
-        if feed not in self.urls:
-            raise ValueError(f"unsupported Alpaca feed: {feed}")
-        self.feed = feed
-        self.url = self.urls[feed]
-        self.symbols = [symbol.upper() for symbol in symbols]
-        self.key = key or os.getenv("APCA_API_KEY_ID")
-        self.secret = secret or os.getenv("APCA_API_SECRET_KEY")
-        if not self.key or not self.secret:
-            raise RuntimeError("Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in the environment")
-        self.accumulator = IEXTradeAccumulator() if feed == "iex" else OvernightQuoteAccumulator()
-        self.channel = "trades" if feed == "iex" else "quotes"
-
-    async def stream(self) -> AsyncIterator[MarketSnapshot]:
-        import websockets
-
-        delay = 1.0
-        while True:
-            try:
-                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as socket:
-                    print(f"已连接 Alpaca 行情：{self.url}")
-                    await socket.send(json.dumps({"action": "auth", "key": self.key, "secret": self.secret}))
-                    authenticated = False
-                    async for raw in socket:
-                        messages = json.loads(raw)
-                        for message in messages:
-                            if message.get("T") == "success" and message.get("msg") == "authenticated":
-                                authenticated = True
-                                print("Alpaca 鉴权成功")
-                                await socket.send(json.dumps({"action": "subscribe", self.channel: self.symbols}))
-                                label = "IEX 实时成交" if self.feed == "iex" else "隔夜实时指示性报价"
-                                print(f"已订阅 {label}：{', '.join(self.symbols)}")
-                                delay = 1.0
-                                continue
-                            if message.get("T") == "error":
-                                code = int(message.get("code", 0))
-                                error = RuntimeError(f"Alpaca stream error {code}: {message.get('msg')}")
-                                if 400 <= code < 500:
-                                    raise PermissionError(str(error))
-                                raise error
-                            snapshot = self.accumulator.ingest(message)
-                            if snapshot is not None:
-                                yield snapshot
-                    if not authenticated:
-                        raise RuntimeError("Alpaca stream closed before authentication")
-            except (asyncio.CancelledError, PermissionError):
-                raise
-            except Exception as error:
-                print(f"{self.feed} 连接中断：{type(error).__name__}；{delay:.0f} 秒后重试")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)
-
-
 def _longbridge_snapshot(symbol: str, quote: object, feed: str,
                          event_type: str) -> MarketSnapshot:
     """Convert Longbridge SecurityQuote/PushQuote without logging credentials."""
@@ -236,115 +75,186 @@ def _longbridge_snapshot(symbol: str, quote: object, feed: str,
     )
 
 
-class LongbridgeHKMarketSource:
-    """Read-only HK quote adapter with realtime capability detection and BMP fallback."""
-
-    def __init__(self, symbols: list[str], poll_seconds: float = 5.0):
-        self.symbols = [self._normalize_symbol(symbol) for symbol in symbols]
+class LongbridgeMarketSource:
+    """One provider for HK regular hours and all four US sessions."""
+    def __init__(self, symbols, poll_seconds=2.0, market="HK"):
+        from .calendar import TradingCalendar
+        self.market = market
+        self.symbols = [self._normalize_symbol(s) for s in symbols]
+        self.api_symbols = [s if market == "HK" else f"{s}.US" for s in self.symbols]
         self.poll_seconds = max(1.0, poll_seconds)
-        required = ("LONGBRIDGE_APP_KEY", "LONGBRIDGE_APP_SECRET",
-                    "LONGBRIDGE_ACCESS_TOKEN")
-        missing = [name for name in required if not os.getenv(name)]
+        self.calendar = TradingCalendar()
+        self.context = None
+        self.endpoint = None
+        self.status = "connecting"
+        self.status_reason = "正在连接长桥行情"
+        self.references = {}
+        required = ("LONGBRIDGE_APP_KEY", "LONGBRIDGE_APP_SECRET", "LONGBRIDGE_ACCESS_TOKEN")
+        missing = [key for key in required if not os.getenv(key)]
         if missing:
-            raise RuntimeError("请在环境变量中设置：" + ", ".join(missing))
+            raise RuntimeError("请设置长桥行情凭据：" + ", ".join(missing))
 
     @staticmethod
-    def _normalize_symbol(symbol: str) -> str:
+    def _normalize_symbol(symbol):
         value = symbol.strip().upper()
-        ticker = value[:-3] if value.endswith(".HK") else value
+        ticker = value.removesuffix(".HK")
         return f"{ticker.lstrip('0') or '0'}.HK"
 
-    @staticmethod
-    def _pull_feed(quote: object) -> str:
-        timestamp = getattr(quote, "timestamp")
-        quote_time = timestamp if isinstance(timestamp, datetime) else pd.Timestamp(timestamp).to_pydatetime()
-        if quote_time.tzinfo is None:
-            quote_time = quote_time.replace(tzinfo=timezone.utc)
-        lag = (datetime.now(timezone.utc) - quote_time.astimezone(timezone.utc)).total_seconds()
-        return "longbridge-hk-bmp" if lag > 120 else "longbridge-hk-poll"
+    async def initialize(self):
+        from longbridge.openapi import AsyncQuoteContext, Config
+        if self.context is not None:
+            return
+        custom = os.getenv("LONGBRIDGE_HTTP_URL")
+        endpoints = [custom] if custom else ["https://openapi.longbridge.cn", "https://openapi.longbridge.com"]
+        for endpoint in endpoints:
+            try:
+                quote_ws = os.getenv("LONGBRIDGE_QUOTE_WS_URL") or (
+                    "wss://openapi-quote.longbridge.cn" if endpoint.endswith(".cn") else "wss://openapi-quote.longbridge.com")
+                config = Config.from_apikey(
+                    os.environ["LONGBRIDGE_APP_KEY"], os.environ["LONGBRIDGE_APP_SECRET"],
+                    os.environ["LONGBRIDGE_ACCESS_TOKEN"], http_url=endpoint, quote_ws_url=quote_ws,
+                    enable_overnight=True, enable_print_quote_packages=False,
+                    enable_papertrading=False)
+                context = AsyncQuoteContext.create(config)
+                await asyncio.wait_for(context.quote(self.api_symbols), 10)
+                self.context, self.endpoint = context, endpoint
+                self.status, self.status_reason = "connected", "长桥行情已连接"
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.status_reason = f"{type(error).__name__}：长桥接入点连接或行情权限不可用"
+        self.status = "retrying"
+        raise ConnectionError(self.status_reason)
 
-    async def stream(self) -> AsyncIterator[MarketSnapshot]:
+    async def lot_sizes(self):
+        await self.initialize()
+        info = await asyncio.wait_for(self.context.static_info(self.api_symbols), 10)
+        return {self._normalize_symbol(item.symbol): int(item.lot_size)
+                for item in info if item.lot_size > 0}
+
+    def snapshots(self, quote, now_ms=None):
+        import time
+        from dataclasses import replace
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        symbol = self._normalize_symbol(quote.symbol)
+        if self.market == "HK" and self.calendar.session_reason(symbol, now_ms) is not None:
+            self.status_reason = f"{symbol} 当前不在港股连续交易时段"
+            return []
+        session = self.calendar.us_session(now_ms) if self.market == "US" else "regular"
+        if session == "closed":
+            return []
+        selected = (getattr(quote, {"pre": "pre_market_quote", "post": "post_market_quote",
+                                 "overnight": "overnight_quote"}[session], None)
+                    if session != "regular" else quote)
+        if selected is None:
+            self.status_reason = f"{symbol} 缺少当前 {session} 时段报价"
+            return []
+        feed = f"longbridge-{self.market.lower()}-{session}"
+        snapshot = _longbridge_snapshot(symbol, selected, feed, "snapshot")
+        # SDK datetimes without tzinfo represent machine-local time: timestamp()
+        # already converts these to UTC. Do not relabel a local naive time as UTC.
+        if snapshot.close <= 0:
+            return []
+        if now_ms - snapshot.market_time_ms > 120_000:
+            snapshot = replace(snapshot, feed=feed + "-stale")
+        status = str(getattr(quote, "trade_status", "")).upper()
+        reference = snapshot.pre_close or snapshot.close
+        self.references[(symbol, session)] = reference
+        snapshot = replace(snapshot, trade_session=session,
+                           pre_close=reference, open=snapshot.open or reference,
+                           high=snapshot.high or snapshot.close, low=snapshot.low or snapshot.close,
+                           halted=int("HALT" in status or "SUSPEND" in status))
+        return [snapshot]
+
+    def push_snapshot(self, symbol, event):
+        import time
+        from dataclasses import replace
+        symbol = self._normalize_symbol(symbol)
+        session = str(getattr(event, "trade_session", "Intraday")).split(".")[-1].lower()
+        session = {"intraday": "regular", "pre": "pre", "post": "post", "overnight": "overnight"}.get(session)
+        now_ms = int(time.time() * 1000)
+        if self.market == "HK" and self.calendar.session_reason(symbol, now_ms) is not None:
+            self.status_reason = f"{symbol} 当前不在港股连续交易时段"
+            return None
+        expected = self.calendar.us_session(now_ms) if self.market == "US" else "regular"
+        if session != expected or expected == "closed":
+            return None
+        snapshot = _longbridge_snapshot(symbol, event, f"longbridge-{self.market.lower()}-{session}", "quote")
+        if snapshot.close <= 0:
+            return None
+        reference = self.references.setdefault((symbol, session), snapshot.open or snapshot.close)
+        return replace(snapshot, trade_session=session, pre_close=reference,
+                       open=snapshot.open or reference)
+
+    async def stream(self):
         delay = 1.0
         while True:
             try:
                 async for snapshot in self._stream_once():
                     delay = 1.0
                     yield snapshot
-                raise RuntimeError("长桥行情连接意外结束")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                if _is_authentication_failure(error):
-                    raise PermissionError(f"长桥鉴权或权限失败：{error}") from error
-                print(f"长桥行情连接中断：{type(error).__name__}；{delay:.0f} 秒后重连")
+                self.status, self.status_reason = "retrying", f"{type(error).__name__}：长桥行情连接异常，正在重试"
+                self.context = None
+                print(f"{self.market} {self.status_reason}")
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                delay = min(delay * 2, 30)
 
-    async def _stream_once(self) -> AsyncIterator[MarketSnapshot]:
-        from longbridge.openapi import AsyncQuoteContext, Config, SubType
-
-        # Explicit construction prevents credentials from being read from a repository .env file.
-        config = Config.from_apikey(
-            os.environ["LONGBRIDGE_APP_KEY"],
-            os.environ["LONGBRIDGE_APP_SECRET"],
-            os.environ["LONGBRIDGE_ACCESS_TOKEN"],
-            enable_print_quote_packages=False,
-            enable_papertrading=True,
-        )
-        context = AsyncQuoteContext.create(config)
-        print(f"已连接长桥港股行情；正在探测实时推送能力：{', '.join(self.symbols)}")
-        initial = await context.quote(self.symbols)
-        for quote in initial:
-            yield _longbridge_snapshot(quote.symbol, quote, self._pull_feed(quote), "snapshot")
-
-        queue: asyncio.Queue[MarketSnapshot] = asyncio.Queue(maxsize=4096)
+    async def _stream_once(self):
+        from longbridge.openapi import SubType
+        await self.initialize()
+        context = self.context
+        queue = asyncio.Queue(maxsize=4096)
         loop = asyncio.get_running_loop()
-
-        def enqueue(snapshot: MarketSnapshot) -> None:
+        def enqueue(snapshot):
             if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+                queue.get_nowait()
             queue.put_nowait(snapshot)
-
-        def on_quote(symbol: str, event: object) -> None:
-            snapshot = _longbridge_snapshot(
-                symbol, event, "longbridge-hk-realtime", "quote")
-            loop.call_soon_threadsafe(enqueue, snapshot)
-
+        def on_quote(symbol, event):
+            snapshot = self.push_snapshot(symbol, event)
+            if snapshot is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(enqueue, snapshot)
         context.set_on_quote(on_quote)
+        subscribed = False
         try:
-            await context.subscribe(self.symbols, [SubType.Quote])
-            print(f"已订阅长桥港股报价；若 {self.poll_seconds:g} 秒内无推送，将主动拉取检查")
-        except Exception as error:
-            print(f"港股实时订阅不可用（{type(error).__name__}），自动改用定时拉取")
-        while True:
             try:
-                yield await asyncio.wait_for(queue.get(), timeout=self.poll_seconds)
-            except asyncio.TimeoutError:
-                for quote in await context.quote(self.symbols):
-                    feed = self._pull_feed(quote)
-                    if feed == "longbridge-hk-bmp":
-                        print(f"权限探测｜{quote.symbol} 返回延迟时间戳，按 BMP 行情处理")
-                    yield _longbridge_snapshot(quote.symbol, quote, feed, "snapshot")
+                await asyncio.wait_for(context.subscribe(self.api_symbols, [SubType.Quote]), 10)
+                subscribed = True
+                self.status_reason = "长桥推送及轮询已启用"
+            except Exception:
+                self.status_reason = "推送不可用，使用长桥行情轮询"
+            # Poll on a fixed cadence even when another symbol keeps pushing;
+            # this also detects session changes and missing extended-hours pushes.
+            next_poll = loop.time()
+            while True:
+                if loop.time() >= next_poll:
+                    for quote in await asyncio.wait_for(context.quote(self.api_symbols), 10):
+                        for snapshot in self.snapshots(quote):
+                            yield snapshot
+                    next_poll = loop.time() + self.poll_seconds
+                try:
+                    yield await asyncio.wait_for(queue.get(), max(.001, next_poll - loop.time()))
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if subscribed:
+                try:
+                    await asyncio.wait_for(context.unsubscribe(self.api_symbols, [SubType.Quote]), 2)
+                except Exception:
+                    pass
 
 
-def snapshots_from_frame(frame: pd.DataFrame) -> list[MarketSnapshot]:
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    result: list[MarketSnapshot] = []
-    for row in frame.to_dict(orient="records"):
-        result.append(MarketSnapshot(
-            symbol=str(row["symbol"]).upper(),
-            market_time_ms=int(row["time"]),
-            fetched_at=fetched_at,
-            pre_close=float(row.get("pre_close") or 0),
-            open=float(row.get("open") or 0),
-            high=float(row.get("high") or 0),
-            low=float(row.get("low") or 0),
-            close=float(row.get("close") or 0),
-            volume=float(row.get("volume") or 0),
-            halted=int(row.get("halted") or 0),
-            feed="tiger-delayed", event_type="snapshot",
-        ))
-    return result
+class LongbridgeHKMarketSource(LongbridgeMarketSource):
+    pass
+
+
+class LongbridgeUSMarketSource(LongbridgeMarketSource):
+    def __init__(self, symbols, poll_seconds=2.0):
+        super().__init__(symbols, poll_seconds, market="US")
+
+    @staticmethod
+    def _normalize_symbol(symbol):
+        return symbol.strip().upper().removesuffix(".US")

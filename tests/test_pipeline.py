@@ -7,10 +7,8 @@ import pandas as pd
 import pytest
 from scipy import sparse
 
-from fly_trader.market import (IEXTradeAccumulator, LongbridgeHKMarketSource, MarketSnapshot,
-                               OvernightQuoteAccumulator, TimestampDeduplicator,
-                               _is_authentication_failure, _longbridge_snapshot,
-                               snapshots_from_frame)
+from fly_trader.market import (LongbridgeHKMarketSource, MarketSnapshot,
+                               TimestampDeduplicator, _longbridge_snapshot)
 from fly_trader.neural import (MaleCNSConnectome, MaleCNSModel, MarketEncoder,
                                NeuralReadout, Stimulus)
 from fly_trader.pipeline import PipelineResult, StrategyPipeline
@@ -37,14 +35,6 @@ def test_timestamp_deduplication_rejects_duplicates_and_old_data():
     assert dedupe.accept(quote(1001))
 
 
-def test_tiger_frame_conversion_uses_provider_time():
-    frame = pd.DataFrame([dict(symbol="aapl", pre_close=100, time=1234, volume=5,
-                               open=100, high=102, low=99, close=101, halted=0)])
-    result = snapshots_from_frame(frame)[0]
-    assert result.symbol == "AAPL"
-    assert result.market_time_ms == 1234
-
-
 def test_market_encoder_direction_and_halt():
     encoder = MarketEncoder(60)
     up, up_meta = encoder.encode(quote(close=102))
@@ -53,52 +43,6 @@ def test_market_encoder_direction_and_halt():
     assert up[:10].mean() > up[10:20].mean()
     assert halted_meta.halted == 1
     assert halted.sum() == 0
-
-
-def test_iex_trade_accumulator_builds_ohlcv_and_uses_exchange_time():
-    accumulator = IEXTradeAccumulator()
-    first = accumulator.ingest({"T": "t", "S": "AAPL", "p": 100.0, "s": 2,
-                                "t": "2026-09-16T13:30:00.123456789Z"})
-    second = accumulator.ingest({"T": "t", "S": "AAPL", "p": 101.0, "s": 3,
-                                 "t": "2026-09-16T13:30:00.223456789Z"})
-    assert first is not None and second is not None
-    assert first.market_time_ms == 1789565400123
-    assert second.pre_close == 100.0
-    assert second.open == 100.0
-    assert second.high == 101.0
-    assert second.low == 100.0
-    assert second.close == 101.0
-    assert second.volume == 5
-    assert second.feed == "iex"
-    assert second.event_type == "trade"
-
-
-def test_overnight_quote_uses_midpoint_and_rejects_crossed_market():
-    accumulator = OvernightQuoteAccumulator()
-    first = accumulator.ingest({"T": "q", "S": "AAPL", "bp": 99.9, "ap": 100.1,
-                                "t": "2026-09-16T02:00:00.123456789Z"})
-    second = accumulator.ingest({"T": "q", "S": "AAPL", "bp": 101.8, "ap": 102.0,
-                                 "t": "2026-09-16T02:00:01.123456789Z"})
-    crossed = accumulator.ingest({"T": "q", "S": "AAPL", "bp": 103.0, "ap": 102.0,
-                                  "t": "2026-09-16T02:00:02Z"})
-    assert first is not None and second is not None
-    assert first.close == 100.0
-    assert second.close == 101.9
-    assert second.high == 101.9
-    assert second.volume == 0
-    assert second.feed == "overnight"
-    assert second.event_type == "indicative_quote"
-    assert crossed is None
-
-
-def test_overnight_quote_rejects_wide_spread_and_large_jump():
-    accumulator = OvernightQuoteAccumulator(max_spread_bps=100, max_jump_fraction=.02)
-    assert accumulator.ingest({"T": "q", "S": "AAPL", "bp": 99.9, "ap": 100.1,
-                               "t": "2026-09-16T02:00:00Z"}) is not None
-    assert accumulator.ingest({"T": "q", "S": "AAPL", "bp": 98, "ap": 102,
-                               "t": "2026-09-16T02:00:01Z"}) is None
-    assert accumulator.ingest({"T": "q", "S": "AAPL", "bp": 102.9, "ap": 103.1,
-                               "t": "2026-09-16T02:00:02Z"}) is None
 
 
 def test_neural_signal_filter_smooths_and_uses_hysteresis():
@@ -216,14 +160,8 @@ def test_account_module_exposes_no_order_operation():
     assert forbidden.isdisjoint(dir(accounts))
 
 
-def test_longbridge_socket_token_url_is_not_treated_as_auth_failure():
-    message = "error sending request for url (https://openapi.longbridge.com/v1/socket/token): client error (Connect)"
-    assert not _is_authentication_failure(RuntimeError(message))
-    assert _is_authentication_failure(RuntimeError("Alpaca stream error 402: auth failed"))
-
-
 def test_order_proposal_is_allowlisted_confirmed_and_never_submits():
-    engine = OrderProposalEngine(confirmation_s=3.0)
+    engine = OrderProposalEngine(allowed_symbols=["NVDA", "2513.HK"], lot_sizes={"2513.HK": 100}, confirmation_s=3.0)
     nvda = MarketSnapshot("NVDA", market_ms("2026-09-16T10:00:00", "America/New_York"),
                           "2026-09-16T14:00:00+00:00",
                           200, 200, 201, 199, 200, 10, 0, feed="iex")
@@ -239,7 +177,7 @@ def test_order_proposal_is_allowlisted_confirmed_and_never_submits():
 
 
 def test_order_proposal_allows_zhipu_and_blocks_non_allowlisted_and_naked_sell():
-    engine = OrderProposalEngine(confirmation_s=0)
+    engine = OrderProposalEngine(allowed_symbols=["NVDA", "2513.HK"], lot_sizes={"2513.HK": 100}, confirmation_s=0)
     account = {"status": "ok", "equity": 1_000_000, "cash": 1_000_000,
                "fx_rates": {"USD": 7.0, "HKD": 1.0}, "positions": []}
     aapl = quote(close=100)
@@ -261,7 +199,7 @@ def test_order_proposal_allows_zhipu_and_blocks_non_allowlisted_and_naked_sell()
 
 
 def test_order_proposal_blocks_outside_regular_session_and_overnight_quotes():
-    engine = OrderProposalEngine(confirmation_s=0)
+    engine = OrderProposalEngine(allowed_symbols=["NVDA", "2513.HK"], lot_sizes={"2513.HK": 100}, confirmation_s=0)
     account = {"status": "ok", "equity": 100_000, "cash": 100_000,
                "fx_rates": {"USD": 1.0}, "positions": []}
     after_hours = MarketSnapshot(
@@ -281,7 +219,7 @@ def test_order_proposal_blocks_outside_regular_session_and_overnight_quotes():
 
 
 def test_order_proposal_enforces_daily_loss_and_five_minute_cooldown():
-    engine = OrderProposalEngine(confirmation_s=0, proposal_cooldown_s=300)
+    engine = OrderProposalEngine(allowed_symbols=["NVDA", "2513.HK"], lot_sizes={"2513.HK": 100}, confirmation_s=0, proposal_cooldown_s=300)
     nvda = MarketSnapshot(
         "NVDA", market_ms("2026-09-16T10:00:00", "America/New_York"),
         "2026-09-16T14:00:00+00:00", 200, 200, 201, 199, 200, 10, 0, feed="iex")
@@ -297,7 +235,7 @@ def test_order_proposal_enforces_daily_loss_and_five_minute_cooldown():
     assert cooling["cooldown_remaining_s"] == 240
     assert engine.evaluate("NVDA", signal, nvda, account, now=300)["status"] == "ready"
 
-    loss_engine = OrderProposalEngine(confirmation_s=0)
+    loss_engine = OrderProposalEngine(allowed_symbols=["NVDA", "2513.HK"], lot_sizes={"2513.HK": 100}, confirmation_s=0)
     loss_account = {**account, "equity": 97_999}
     blocked = loss_engine.evaluate("NVDA", signal, nvda, loss_account, now=0)
     assert blocked["status"] == "blocked"
@@ -305,7 +243,7 @@ def test_order_proposal_enforces_daily_loss_and_five_minute_cooldown():
 
 
 def test_strategy_pipeline_builds_shared_versioned_event():
-    proposal_engine = OrderProposalEngine(confirmation_s=0, proposal_cooldown_s=0)
+    proposal_engine = OrderProposalEngine(allowed_symbols=["NVDA", "2513.HK"], lot_sizes={"2513.HK": 100}, confirmation_s=0, proposal_cooldown_s=0)
     pipeline = StrategyPipeline(50, proposal_engine=proposal_engine)
     pipeline.filter.adaptive = False
     pipeline.filter.enter_threshold = .1

@@ -10,8 +10,31 @@
   <main>
     <header>
       <div><p class="eyebrow">FLY-CORE-V1 · RAW PRIMARY · SIGNAL ONLY</p><h1>果蝇交易实验台</h1></div>
-      <div class="controls"><span id="connection" class="pill">连接中</span><button id="pause">暂停实验</button></div>
+      <div class="controls"><span id="connection" class="pill">连接中</span><button id="pause" disabled>暂停实验</button><button id="stop" disabled>提前结束</button></div>
     </header>
+    <section class="card experiment-card">
+      <div class="title"><h2>配置实验</h2><strong id="countdown">等待开始</strong></div>
+      <form id="experimentForm">
+        <fieldset id="experimentFields">
+          <label>美股代码<input id="usSymbols" name="us_symbols" placeholder="例如 AAPL, MSFT" autocomplete="off"></label>
+          <label>港股代码<input id="hkSymbols" name="hk_symbols" placeholder="例如 00700, 9988.HK" autocomplete="off"></label>
+          <label>持续时长<input id="duration" type="number" min="0.001" step="any" value="60" required></label>
+          <label>单位<select id="durationUnit"><option value="60">分钟</option><option value="3600">小时</option></select></label>
+          <button type="submit" id="start">开始实验</button>
+        </fieldset>
+      </form>
+      <p class="performance-note">每条实验轨道独立分配 USD 1,000,000 和 HKD 1,000,000。代码以逗号或空白分隔，可只填一个市场。暂停期间仍计时。</p>
+      <p id="durationHint" class="performance-note"></p>
+      <p id="experimentMessage" role="status"></p>
+      <p id="formError" role="alert" class="negative"></p>
+    </section>
+    <section id="resultCard" class="card experiment-card" hidden>
+      <div class="title"><h2>实验结果</h2><a id="downloadReport" href="/api/experiment/report" download="report.json">下载 JSON 报告</a></div>
+      <p id="resultMeta"></p><div id="resultAccounts" class="result-accounts"></div>
+      <div id="resultDiagnostics"></div>
+      <details><summary>本地模拟成交记录</summary><div id="resultTrades"></div></details>
+      <p class="performance-note">到期保留持仓，按最后有效行情估值。各轨道、各币种独立结算；收益率 =（总资产 − 初始资金）÷ 初始资金。</p>
+    </section>
     <nav class="market-tabs" aria-label="市场切换">
       <button class="market-tab" data-market="HK">港股</button>
       <button class="market-tab" data-market="US">美股</button>
@@ -20,22 +43,35 @@
     <div class="workspace">
       <div class="market-content">
         <section class="hero card">
-          <div><span>果蝇原始信号（主指标）</span><strong id="rawTrack" class="hold">观望</strong></div>
+          <div><span>果蝇原始信号（主指标）</span><strong id="rawTrack" class="hold">观望</strong><small id="rawSignalNote"></small></div>
           <div><span>人工过滤信号（对照）</span><strong id="signal" class="hold">观望</strong></div>
           <div><span>风控可执行信号（对照）</span><strong id="executableTrack" class="hold">观望</strong></div>
-          <div><span>标的 / 行情源</span><strong id="source">—</strong></div>
+          <div><span>标的 / 行情源</span><strong id="source">—</strong><small id="feedName">等待行情</small></div>
           <div><span>最新价格</span><strong id="price">—</strong></div>
           <div><span>报价年龄</span><strong id="age">—</strong></div>
         </section>
+        <section id="marketNotice" class="market-notice" role="status" hidden></section>
         <section id="assets" class="assets"></section>
         <section class="card performance-card">
-          <div class="title"><h2>本次运行实时收益对比</h2><span id="performanceMeta">等待第一条实验事件</span></div>
-          <div class="performance-head"><span>轨道</span><span>收益</span><span>最大回撤</span><span>交易 / 回合</span><span>状态</span></div>
-          <div id="performanceRows" class="performance-rows"><span>暂无数据</span></div>
-          <p class="performance-note">假想成交，默认手续费 3bp + 滑点 5bp；不是账户真实收益。</p>
+          <div class="title"><div><p class="eyebrow">INDEPENDENT PORTFOLIOS</p><h2>实验资金与收益对比</h2></div><span id="performanceMeta">每条轨道独立初始资金 1,000,000</span></div>
+          <div class="table-scroll"><table class="portfolio-table"><thead><tr><th>实验轨道</th><th>初始资金</th><th>总资产</th><th>净收益</th><th>收益率</th><th>最大回撤</th><th>累计买入 / 股</th><th>累计卖出 / 股</th><th>成交次数</th></tr></thead><tbody id="performanceRows"></tbody></table></div>
+          <p class="performance-note">原始、人工过滤及买入持有轨道按股票等分预算，买入建仓、卖出清仓；风控轨道按原有提案数量交易。手续费 3bp + 滑点 5bp 已计入收益。断开连接组为不交易的现金对照。</p>
         </section>
+      <aside class="card account-card">
+        <div class="title"><div><p class="eyebrow">PORTFOLIO DETAILS</p><h2>持仓与交易统计</h2><span id="accountProvider">初始资金各一百万</span></div><label class="track-selector">实验轨道<select id="trackSelector"><option value="fly_raw">果蝇原始</option><option value="fly_filtered">人工过滤</option><option value="risk_executable">风控可执行</option><option value="buy_and_hold">买入持有</option><option value="disconnected_connectome">断开连接组</option></select></label></div>
+        <div class="account-summary">
+          <div><span>净资产</span><strong id="accountEquity">—</strong></div>
+          <div><span>现金</span><strong id="accountCash">—</strong></div>
+          <div><span>购买力</span><strong id="accountBuyingPower">—</strong></div>
+          <div><span>持仓数</span><strong id="positionCount">—</strong></div>
+          <div><span>已实现盈亏</span><strong id="realizedPl">—</strong></div>
+          <div><span>未实现盈亏</span><strong id="unrealizedPl">—</strong></div>
+        </div>
+        <div id="positions" class="positions"><span>暂无持仓</span></div>
+        <p class="performance-note">持仓成本价含买入费用；平均买入/卖出价不含费用。清仓后仍保留累计股数与已实现收益。</p>
+      </aside>
         <section class="card proposal-card">
-          <div class="title"><h2>订单提案预演（不下单）</h2><span id="proposalStatus">等待稳定信号</span></div>
+          <div class="title"><h2>本地模拟成交风控</h2><span id="proposalStatus">等待稳定信号</span></div>
           <div class="proposal-grid">
             <div><span>方向</span><strong id="proposalAction">观望</strong></div>
             <div><span>建议数量</span><strong id="proposalQuantity">0</strong></div>
@@ -64,18 +100,9 @@
             </dl>
           </article>
         </section>
-        <section class="card notice"><strong>研究模式：只生成信号，不下单。</strong><span>页面不会显示或传输 API 密钥。</span></section>
+        <section class="card notice"><strong>研究模式：本地模拟买卖，不向券商下单。</strong><span>页面不会显示或传输 API 密钥。</span></section>
       </div>
-      <aside class="card account-card">
-        <div class="title"><h2>全部持仓（只读）</h2><span id="accountProvider">等待账户数据</span></div>
-        <div class="account-summary">
-          <div><span>净资产</span><strong id="accountEquity">—</strong></div>
-          <div><span>现金</span><strong id="accountCash">—</strong></div>
-          <div><span>购买力</span><strong id="accountBuyingPower">—</strong></div>
-          <div><span>持仓数</span><strong id="positionCount">—</strong></div>
-        </div>
-        <div id="positions" class="positions"><span>暂无持仓</span></div>
-      </aside>
+
     </div>
   </main>
   <script src="/dashboard.js"></script>

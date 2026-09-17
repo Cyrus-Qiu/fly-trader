@@ -5,15 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fly-trader"
 version = "0.1.0"
-description = "Read-only IEX market data experiment driven by the MaleCNS connectome"
+description = "Dual-market local simulation experiment driven by the MaleCNS connectome"
 requires-python = ">=3.12"
 dependencies = [
   "numpy>=2.3,<3",
   "scipy>=1.16,<2",
   "pandas>=2.3,<4",
-  "pyarrow>=21,<24",
-  "tigeropen>=3.7,<4",
-  "websockets>=15,<17",
   "longbridge>=5,<6",
   "python-dotenv>=1.1,<2",
 ]
