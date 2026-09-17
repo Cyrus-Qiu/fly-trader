@@ -1,0 +1,10 @@
+# Python 3.14 / Windows versions verified on 2026-09-16.
+numpy==2.5.3
+pandas==3.0.5
+pyarrow==23.0.1
+scipy==1.18.1
+tigeropen==3.7.2
+websockets==16.1.1
+longbridge==5.0.0
+python-dotenv==1.2.3
+pytest==9.1.1

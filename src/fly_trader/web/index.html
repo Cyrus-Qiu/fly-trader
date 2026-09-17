@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>果蝇交易实验台</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow">FLY-CORE-V1 · RAW PRIMARY · SIGNAL ONLY</p><h1>果蝇交易实验台</h1></div>
+      <div class="controls"><span id="connection" class="pill">连接中</span><button id="pause">暂停实验</button></div>
+    </header>
+    <nav class="market-tabs" aria-label="市场切换">
+      <button class="market-tab" data-market="HK">港股</button>
+      <button class="market-tab" data-market="US">美股</button>
+      <span id="marketHint"></span>
+    </nav>
+    <div class="workspace">
+      <div class="market-content">
+        <section class="hero card">
+          <div><span>果蝇原始信号（主指标）</span><strong id="rawTrack" class="hold">观望</strong></div>
+          <div><span>人工过滤信号（对照）</span><strong id="signal" class="hold">观望</strong></div>
+          <div><span>风控可执行信号（对照）</span><strong id="executableTrack" class="hold">观望</strong></div>
+          <div><span>标的 / 行情源</span><strong id="source">—</strong></div>
+          <div><span>最新价格</span><strong id="price">—</strong></div>
+          <div><span>报价年龄</span><strong id="age">—</strong></div>
+        </section>
+        <section id="assets" class="assets"></section>
+        <section class="card performance-card">
+          <div class="title"><h2>本次运行实时收益对比</h2><span id="performanceMeta">等待第一条实验事件</span></div>
+          <div class="performance-head"><span>轨道</span><span>收益</span><span>最大回撤</span><span>交易 / 回合</span><span>状态</span></div>
+          <div id="performanceRows" class="performance-rows"><span>暂无数据</span></div>
+          <p class="performance-note">假想成交，默认手续费 3bp + 滑点 5bp；不是账户真实收益。</p>
+        </section>
+        <section class="card proposal-card">
+          <div class="title"><h2>订单提案预演（不下单）</h2><span id="proposalStatus">等待稳定信号</span></div>
+          <div class="proposal-grid">
+            <div><span>方向</span><strong id="proposalAction">观望</strong></div>
+            <div><span>建议数量</span><strong id="proposalQuantity">0</strong></div>
+            <div><span>参考价格</span><strong id="proposalPrice">—</strong></div>
+            <div><span>风控结论</span><strong id="proposalReason">稳定信号为观望</strong></div>
+          </div>
+          <div id="riskChecks" class="risk-checks"><span>等待风控检查</span></div>
+        </section>
+        <section class="grid">
+          <article class="card chart-card"><div class="title"><h2>神经方向分数</h2><span>最近300个行情事件</span></div><canvas id="scoreChart"></canvas></article>
+          <article class="card metrics">
+            <h2>实时状态</h2>
+            <dl>
+              <div><dt>原始信号</dt><dd id="rawAction">—</dd></div>
+              <div><dt>原始分数</dt><dd id="rawScore">—</dd></div>
+              <div><dt>平滑分数</dt><dd id="smoothScore">—</dd></div>
+              <div><dt>窗口均值</dt><dd id="windowMean">—</dd></div>
+              <div><dt>动态进入阈值</dt><dd id="enterThreshold">—</dd></div>
+              <div><dt>距离触发</dt><dd id="triggerDistance">—</dd></div>
+              <div><dt>校准状态</dt><dd id="calibration">—</dd></div>
+              <div><dt>刺激强度</dt><dd id="stimulus">—</dd></div>
+              <div><dt>模型步数</dt><dd id="steps">—</dd></div>
+              <div><dt>接收 / 接纳行情</dt><dd id="eventHealth">—</dd></div>
+              <div><dt>丢弃 / 重复事件</dt><dd id="dropHealth">—</dd></div>
+              <div><dt>最大计算延迟</dt><dd id="latencyHealth">—</dd></div>
+            </dl>
+          </article>
+        </section>
+        <section class="card notice"><strong>研究模式：只生成信号，不下单。</strong><span>页面不会显示或传输 API 密钥。</span></section>
+      </div>
+      <aside class="card account-card">
+        <div class="title"><h2>全部持仓（只读）</h2><span id="accountProvider">等待账户数据</span></div>
+        <div class="account-summary">
+          <div><span>净资产</span><strong id="accountEquity">—</strong></div>
+          <div><span>现金</span><strong id="accountCash">—</strong></div>
+          <div><span>购买力</span><strong id="accountBuyingPower">—</strong></div>
+          <div><span>持仓数</span><strong id="positionCount">—</strong></div>
+        </div>
+        <div id="positions" class="positions"><span>暂无持仓</span></div>
+      </aside>
+    </div>
+  </main>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-tmp*/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and broker configuration
+config/*.properties
+config/*.ini
+config/*.json
+config/*.yaml
+config/*.yml
+!config/*.example.*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Runtime data, logs, downloaded connectome caches, and references
+data/
+artifacts/
+logs/
+*.log
+_reference/
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
